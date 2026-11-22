@@ -256,17 +256,23 @@ async def get_user_books_stats(db_path: str, user_id: int) -> list[dict]:
 
 
 async def get_read_char_offset(db_path: str, book_id: int) -> int:
+    """
+    Кітаптағы соңғы 'read' маркер/порцияның end_char позициясын қайтарады.
+    """
     async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute(
             """
-            SELECT COALESCE(MAX(end_char), 0)
+            SELECT end_char
             FROM portions
             WHERE book_id = ? AND status = 'read'
+            ORDER BY id DESC
+            LIMIT 1
             """,
             (book_id,),
         )
         row = await cur.fetchone()
-        return int(row[0] or 0)
+        return int(row["end_char"] or 0) if row else 0
 
 
 async def get_pending_portion(db_path: str, user_id: int, book_id: int) -> dict | None:
@@ -410,32 +416,33 @@ async def jump_book_to_offset(
     read_words_count: int,
 ) -> None:
     """
-    Сырттан оқылған бетке/мәтінге сәйкес кітаптағы позицияны белгіленген offset-ке жылжытады.
+    Сырттан оқылған бетке/мәтінге сәйкес кітаптағы позицияны дәл көрсетілген offset-ке жылжытады.
+    Оқылмаған бұрынғы порцияларды тазалап, қате беттен келген порциялардың қайта шығуын болдырмайды.
     """
     now_str = datetime.now().isoformat(timespec="seconds")
     today_str = datetime.now().date().isoformat()
+    safe_offset = max(0, int(target_char_offset))
 
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
 
-        # Бұрынғы аяқталмаған порцияларды жабу (ескі порция қайта шықпауы үшін)
+        # Оқылмаған ('pending', 'later') порцияларды өшіру — қате беттен жіберілген порциялар қайта шықпайды
         await db.execute(
             """
-            UPDATE portions
-            SET status = 'skipped'
-            WHERE user_id = ? AND book_id = ? AND status IN ('pending', 'later')
+            DELETE FROM portions
+            WHERE user_id = ? AND book_id = ? AND status IN ('pending', 'later', 'cancelled', 'skipped')
             """,
             (user_id, book_id),
         )
 
-        # Жаңа орынды 'read' күйіндегі маркер-порция ретінде тіркеу
+        # Жаңа позицияны тікелей бекитін жазба қосу
         await db.execute(
             """
             INSERT INTO portions (
                 user_id, book_id, day_number, words_count, start_char, end_char, content_text, status, created_at
-            ) VALUES (?, ?, 1, 0, 0, ?, '[Сырттан оқылған жерге өту]', 'read', ?)
+            ) VALUES (?, ?, 1, 0, 0, ?, '[Позиция өзгертілді]', 'read', ?)
             """,
-            (user_id, book_id, max(0, target_char_offset), now_str),
+            (user_id, book_id, safe_offset, now_str),
         )
 
         b_cur = await db.execute(
@@ -456,7 +463,6 @@ async def jump_book_to_offset(
             (clamped_read_words, is_completed, book_id),
         )
 
-        # Күндік жоспарды жаңа оқылған сөз санына сай қайта реттеу
         d_cur = await db.execute(
             """
             SELECT * FROM daily_progress
