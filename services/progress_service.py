@@ -18,17 +18,11 @@ def make_progress_bar(percent: int, length: int = 8) -> str:
 
 
 def prepare_readable_text(text: str) -> str:
-    """
-    PDF/MD мәтінін қалыпқа келтіреді:
-    - Арабша таңбаларды таза Unicode күйіне келтіреді
-    - Сөйлем ортасынан үзілген қысқа жолдарды біріктіріп, таза абзацтар түзеді
-    """
     if not text:
         return ""
 
     cleaned = unicodedata.normalize("NFKC", text)
     cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
-    # Жол соңындағы тасымал сызықшаларын (мысалы: сөз-\nдің -> сөздің) біріктіру
     cleaned = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", cleaned)
 
     raw_lines = [line.strip() for line in cleaned.split("\n")]
@@ -47,7 +41,6 @@ def prepare_readable_text(text: str) -> str:
             _flush_para()
             continue
 
-        # Тақырып сияқты көрінетін жолды бөлек абзац ретінде шығару
         is_md_heading = bool(re.match(r"^#{1,6}\s+.+$", line))
         is_keyword_heading = bool(HEADING_KEYWORD_RE.match(line)) and len(line) <= 110
         is_short_title = (
@@ -64,8 +57,6 @@ def prepare_readable_text(text: str) -> str:
 
         current_para.append(line)
 
-        # Егер жол соңында нүкте/сұрақ/леп белгісі болса және келесі жол үлкен әріппен басталса,
-        # абзацты аяқтауға мүмкіндік береміз, бірақ сөйлем үзілмесе жалғай береміз
         if len(line) > 95 and re.search(r"[.!?…]$", line):
             _flush_para()
 
@@ -81,7 +72,6 @@ def _is_heading_paragraph(para: str) -> bool:
         return True
     if HEADING_KEYWORD_RE.match(s) and len(s) <= 110:
         return True
-    # Қысқа, соңында нүктесі жоқ жолдар (мысалы, кітаптағы бөлім/тақырып атауы)
     words = s.split()
     if len(s) <= 60 and 1 <= len(words) <= 7 and not re.search(r"[.!?…,:;]$", s):
         return True
@@ -89,9 +79,6 @@ def _is_heading_paragraph(para: str) -> bool:
 
 
 def format_portion_html(text: str) -> str:
-    """
-    Мәтінді реттеп, тақырыптарды қалың (<b>...</b>) етіп Telegram HTML форматына келтіреді.
-    """
     readable = prepare_readable_text(text)
     if not readable:
         return ""
@@ -116,7 +103,6 @@ def format_portion_html(text: str) -> str:
         escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
         escaped = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", escaped)
 
-        # Егер абзацта араб әріптері басым болса, оңнан-солға бағыт белгісін қосу
         arabic_count = len(ARABIC_CHAR_RE.findall(b))
         if arabic_count >= 5:
             escaped = "\u200f" + escaped
@@ -127,9 +113,6 @@ def format_portion_html(text: str) -> str:
 
 
 def split_message_chunks(text: str, max_len: int = 3500) -> list[str]:
-    """
-    Telegram-ның 4096 таңба шегіне жеткізбей, реттелген мәтінді абзац бойынша бөледі.
-    """
     readable = prepare_readable_text(text)
     if not readable:
         return []
@@ -167,10 +150,6 @@ def extract_next_portion(
     start_char: int,
     target_words: int,
 ) -> tuple[str, int, int, int, bool]:
-    """
-    md_path файлынан start_char позициясынан бастап шамамен target_words сөз алады.
-    Қайтарады: (portion_text, actual_words, new_start_char, new_end_char, is_book_finished)
-    """
     with open(md_path, "r", encoding="utf-8") as f:
         full_text = f.read()
 
@@ -208,3 +187,75 @@ def extract_next_portion(
     is_finished = cut_index >= total_len
 
     return portion_text, actual_words, actual_start, cut_index, is_finished
+
+
+def get_page_char_offset(
+    md_path: str,
+    page_number: int,
+    words_per_page: int,
+) -> tuple[int, int]:
+    """
+    Көрсетілген бет нөміріне (page_number) дейінгі оқылған сөз саны мен .md позициясын қайтарады.
+    Қайтарады: (char_offset, read_words_count)
+    """
+    with open(md_path, "r", encoding="utf-8") as f:
+        full_text = f.read()
+
+    total_len = len(full_text)
+    if page_number <= 1 or total_len == 0:
+        return 0, 0
+
+    target_words = max(0, (page_number - 1) * max(1, words_per_page))
+    if target_words == 0:
+        return 0, 0
+
+    word_pattern = re.compile(r"\b\w+\b", flags=re.UNICODE)
+    words_seen = 0
+    offset = total_len
+
+    for match in word_pattern.finditer(full_text):
+        words_seen += 1
+        if words_seen >= target_words:
+            offset = match.end()
+            break
+
+    return offset, words_seen
+
+
+def find_text_char_offset(
+    md_path: str,
+    query_text: str,
+) -> tuple[int, int] | None:
+    """
+    Мәтін үзіндісін іздеп, табылған жердің бастапқы символ орнын және сол жерге дейінгі сөз санын қайтарады.
+    """
+    cleaned_query = unicodedata.normalize("NFKC", query_text).strip()
+    if not cleaned_query:
+        return None
+
+    with open(md_path, "r", encoding="utf-8") as f:
+        full_text = f.read()
+
+    norm_full = unicodedata.normalize("NFKC", full_text)
+    idx = norm_full.lower().find(cleaned_query.lower())
+    if idx == -1:
+        # Бос орындар мен жаңа жолдарды бір бос орынға келтіріп қайта іздеу
+        compact_query = re.sub(r"\s+", " ", cleaned_query).strip().lower()
+        compact_full = re.sub(r"\s+", " ", norm_full).lower()
+        c_idx = compact_full.find(compact_query)
+        if c_idx == -1:
+            return None
+        words_before = count_words(compact_full[:c_idx])
+        # Сөз санына сәйкес шамамен char offset табу
+        word_pattern = re.compile(r"\b\w+\b", flags=re.UNICODE)
+        seen = 0
+        char_pos = 0
+        for m in word_pattern.finditer(full_text):
+            if seen >= words_before:
+                break
+            seen += 1
+            char_pos = m.end()
+        return char_pos, words_before
+
+    words_before = count_words(norm_full[:idx])
+    return idx, words_before

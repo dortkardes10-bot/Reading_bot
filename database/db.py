@@ -402,6 +402,115 @@ async def mark_portion_read_and_update_progress(
         await db.commit()
 
 
+async def jump_book_to_offset(
+    db_path: str,
+    user_id: int,
+    book_id: int,
+    target_char_offset: int,
+    read_words_count: int,
+) -> None:
+    """
+    Сырттан оқылған бетке/мәтінге сәйкес кітаптағы позицияны белгіленген offset-ке жылжытады.
+    """
+    now_str = datetime.now().isoformat(timespec="seconds")
+    today_str = datetime.now().date().isoformat()
+
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+
+        # Бұрынғы аяқталмаған порцияларды жабу (ескі порция қайта шықпауы үшін)
+        await db.execute(
+            """
+            UPDATE portions
+            SET status = 'skipped'
+            WHERE user_id = ? AND book_id = ? AND status IN ('pending', 'later')
+            """,
+            (user_id, book_id),
+        )
+
+        # Жаңа орынды 'read' күйіндегі маркер-порция ретінде тіркеу
+        await db.execute(
+            """
+            INSERT INTO portions (
+                user_id, book_id, day_number, words_count, start_char, end_char, content_text, status, created_at
+            ) VALUES (?, ?, 1, 0, 0, ?, '[Сырттан оқылған жерге өту]', 'read', ?)
+            """,
+            (user_id, book_id, max(0, target_char_offset), now_str),
+        )
+
+        b_cur = await db.execute(
+            "SELECT total_words FROM books WHERE id = ?",
+            (book_id,),
+        )
+        b_row = await b_cur.fetchone()
+        total_words = int(b_row["total_words"] or 0) if b_row else 0
+        clamped_read_words = max(0, min(total_words, read_words_count))
+        is_completed = 1 if (total_words > 0 and clamped_read_words >= int(total_words * 0.98)) else 0
+
+        await db.execute(
+            """
+            UPDATE books
+            SET read_words = ?, is_completed = ?
+            WHERE id = ?
+            """,
+            (clamped_read_words, is_completed, book_id),
+        )
+
+        # Күндік жоспарды жаңа оқылған сөз санына сай қайта реттеу
+        d_cur = await db.execute(
+            """
+            SELECT * FROM daily_progress
+            WHERE book_id = ?
+            ORDER BY day_number ASC
+            """,
+            (book_id,),
+        )
+        days = [dict(r) for r in await d_cur.fetchall()]
+        rem_words_to_credit = clamped_read_words
+        for d in days:
+            t_words = max(1, int(d["target_words"]))
+            if rem_words_to_credit >= t_words:
+                await db.execute(
+                    "UPDATE daily_progress SET read_words = ?, is_completed = 1 WHERE id = ?",
+                    (t_words, d["id"]),
+                )
+                rem_words_to_credit -= t_words
+            elif rem_words_to_credit > 0:
+                await db.execute(
+                    "UPDATE daily_progress SET read_words = ?, is_completed = 0 WHERE id = ?",
+                    (rem_words_to_credit, d["id"]),
+                )
+                rem_words_to_credit = 0
+            else:
+                await db.execute(
+                    "UPDATE daily_progress SET read_words = 0, is_completed = 0 WHERE id = ?",
+                    (d["id"],),
+                )
+
+        if clamped_read_words > 0:
+            u_cur = await db.execute(
+                "SELECT streak_days, last_read_date FROM users WHERE user_id = ?",
+                (user_id,),
+            )
+            u_row = await u_cur.fetchone()
+            if u_row:
+                last_date = u_row["last_read_date"]
+                streak = u_row["streak_days"] or 0
+                yesterday_str = (datetime.now().date() - timedelta(days=1)).isoformat()
+                if last_date == today_str:
+                    new_streak = max(1, streak)
+                elif last_date == yesterday_str:
+                    new_streak = streak + 1
+                else:
+                    new_streak = 1
+                await db.execute(
+                    "UPDATE users SET streak_days = ?, last_read_date = ? WHERE user_id = ?",
+                    (new_streak, today_str, user_id),
+                )
+
+        await db.commit()
+
+
 async def get_book_progress_summary(db_path: str, book_id: int) -> dict:
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row

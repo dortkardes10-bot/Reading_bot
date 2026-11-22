@@ -15,8 +15,10 @@ from database.db import (
     set_user_paused,
     skip_current_day_plan,
     apply_catchup_decision,
+    jump_book_to_offset,
 )
 from handlers.portion import _send_portion_to_user
+from services.progress_service import get_page_char_offset, find_text_char_offset
 
 router = Router()
 
@@ -51,12 +53,111 @@ async def cmd_settings(message: Message) -> None:
         f"📖 Бір порция көлемі: <b>~{portion_pages} бет</b>\n"
         f"🔔 Хабарлама күйі: <b>{paused_text}</b>\n\n"
         "<b>Пайдалы командалар:</b>\n"
+        "• <code>/goto 45</code> — 45-бетке өту (сырттан оқып қойған жерден жалғастыру)\n"
+        "• <code>/find сөз немесе сөйлем</code> — мәтін бойынша қажетті жерді табу\n"
         "• <code>/time 08:30</code> — еске салғыш уақытын өзгерту\n"
         "• <code>/today</code> — бүгінгі норманы көру\n"
         "• <code>/stats</code> — жалпы оқу статистикасы\n"
         "• <code>/pause</code> / <code>/resume</code> — еске салғышты уақытша тоқтату/қосу\n"
         "• <code>/skip_day</code> — бүгінгі күнді өткізіп, қалғанын бөлу\n"
-        "• <code>/book</code> — жаңа кітап жүктеу"
+        "• <code>/book</code> — жаңа кітап жүктеу немесе басқа кітапқа ауысу"
+    )
+
+
+@router.message(Command("goto", "page"))
+async def cmd_goto_page(message: Message) -> None:
+    await _ensure(message)
+    book = await get_active_book(str(settings.DB_PATH), message.from_user.id)
+    if not book:
+        await message.answer("📚 Белсенді кітап жоқ. Алдымен <b>«📚 Кітап»</b> арқылы кітап жүктеңіз.")
+        return
+
+    parts = (message.text or "").strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await message.answer(
+            "⚠️ Бет нөмірін жазыңыз. Мысалы: <code>/goto 45</code>\n"
+            f"(Бұл кітапта шамамен <b>~{book['total_pages']} бет</b>)"
+        )
+        return
+
+    page_num = int(parts[1].strip())
+    max_pages = max(1, int(book.get("total_pages") or 1))
+    if page_num < 1 or page_num > max_pages:
+        await message.answer(
+            f"⚠️ Бет нөмірі <b>1</b> мен <b>{max_pages}</b> аралығында болуы керек."
+        )
+        return
+
+    try:
+        char_offset, read_words_count = get_page_char_offset(
+            md_path=book["md_path"],
+            page_number=page_num,
+            words_per_page=settings.WORDS_PER_PAGE,
+        )
+    except FileNotFoundError:
+        await message.answer("❌ Кітаптың мәтін файлы табылмады.")
+        return
+
+    await jump_book_to_offset(
+        db_path=str(settings.DB_PATH),
+        user_id=message.from_user.id,
+        book_id=book["id"],
+        target_char_offset=char_offset,
+        read_words_count=read_words_count,
+    )
+
+    pct = min(100, round(read_words_count / max(1, int(book.get("total_words") or 1)) * 100))
+    await message.answer(
+        f"📍 <b>«{html.escape(book['title'])}»</b> кітабында <b>{page_num}-бетке</b> өттік!\n"
+        f"📊 Прогресс: <b>~{page_num} / ~{max_pages} бет ({pct}%)</b>\n\n"
+        "Жалғастыру үшін <b>«📖 Порция ал»</b> батырмасын басыңыз!"
+    )
+
+
+@router.message(Command("find"))
+async def cmd_find_text(message: Message) -> None:
+    await _ensure(message)
+    book = await get_active_book(str(settings.DB_PATH), message.from_user.id)
+    if not book:
+        await message.answer("📚 Белсенді кітап жоқ. Алдымен <b>«📚 Кітап»</b> арқылы кітап жүктеңіз.")
+        return
+
+    parts = (message.text or "").strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer(
+            "⚠️ Іздейтін сөзді немесе сөйлем үзіндісін жазыңыз.\n"
+            "Мысалы: <code>/find уақытты басқару</code>"
+        )
+        return
+
+    query = parts[1].strip()
+    try:
+        found = find_text_char_offset(md_path=book["md_path"], query_text=query)
+    except FileNotFoundError:
+        await message.answer("❌ Кітаптың мәтін файлы табылмады.")
+        return
+
+    if not found:
+        await message.answer(
+            f"🔍 <b>«{html.escape(query)}»</b> үзіндісі табылмады.\n"
+            "Қысқа әрі нақтырақ сөз/сөйлем жазып көріңіз немесе <code>/goto &lt;бет&gt;</code> қолданыңыз."
+        )
+        return
+
+    char_offset, read_words_count = found
+    await jump_book_to_offset(
+        db_path=str(settings.DB_PATH),
+        user_id=message.from_user.id,
+        book_id=book["id"],
+        target_char_offset=char_offset,
+        read_words_count=read_words_count,
+    )
+
+    approx_page = max(1, round(read_words_count / max(1, settings.WORDS_PER_PAGE)))
+    await message.answer(
+        f"🎯 <b>«{html.escape(query)}»</b> кездескен жер табылды (~<b>{approx_page}-бет</b>)!\n"
+        "Позиция сол жерге жылжытылды.\n\n"
+        "Жалғастыру үшін <b>«📖 Порция ал»</b> батырмасын басыңыз!"
     )
 
 
