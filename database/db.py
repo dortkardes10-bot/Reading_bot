@@ -213,7 +213,7 @@ async def get_active_book(db_path: str, user_id: int) -> dict | None:
         return dict(row) if row else None
 
 
-async def get_user_books_stats(db_path: str, user_id: int) -> list[dict]:
+async def get_user_books(db_path: str, user_id: int) -> list[dict]:
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
@@ -225,6 +225,34 @@ async def get_user_books_stats(db_path: str, user_id: int) -> list[dict]:
             (user_id,),
         )
         return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_book_by_id(db_path: str, book_id: int, user_id: int) -> dict | None:
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM books WHERE id = ? AND user_id = ?",
+            (book_id, user_id),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def set_active_book(db_path: str, user_id: int, book_id: int) -> bool:
+    book = await get_book_by_id(db_path, book_id, user_id)
+    if not book:
+        return False
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "UPDATE users SET active_book_id = ? WHERE user_id = ?",
+            (book_id, user_id),
+        )
+        await db.commit()
+    return True
+
+
+async def get_user_books_stats(db_path: str, user_id: int) -> list[dict]:
+    return await get_user_books(db_path, user_id)
 
 
 async def get_read_char_offset(db_path: str, book_id: int) -> int:
@@ -415,7 +443,6 @@ async def skip_current_day_plan(db_path: str, book_id: int) -> dict | None:
             (day_row["id"],),
         )
 
-        # Қалған күндерге бөлу
         rem_cur = await db.execute(
             """
             SELECT * FROM daily_progress
@@ -498,7 +525,6 @@ async def apply_catchup_decision(db_path: str, book_id: int, double_tomorrow: bo
         later_days = [dict(r) for r in await next_cur.fetchall()]
 
         if not later_days:
-            # Егер соңғы күн болса, ағымдағы күннің нысанасын көбейту
             new_target = today_day["read_words"] + shortfall
             await db.execute(
                 "UPDATE daily_progress SET target_words = ? WHERE id = ?",
@@ -508,7 +534,6 @@ async def apply_catchup_decision(db_path: str, book_id: int, double_tomorrow: bo
             return {"shortfall": shortfall, "next_day_target": new_target}
 
         if double_tomorrow:
-            # Бүгінгі орындалмаған бөлікті ертеңгі күнге қосу
             tomorrow = later_days[0]
             new_tomorrow_target = tomorrow["target_words"] + shortfall
             await db.execute(
@@ -526,7 +551,6 @@ async def apply_catchup_decision(db_path: str, book_id: int, double_tomorrow: bo
                 "next_day_target": new_tomorrow_target,
             }
         else:
-            # Қалған барлық күндерге біркелкі бөлу
             extra_per_day = max(1, shortfall // len(later_days))
             for ld in later_days:
                 await db.execute(

@@ -1,13 +1,21 @@
+import html
 import os
 import re
 from aiogram import Router, F, Bot
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 from config import settings
-from database.db import ensure_user, create_book_with_plan, get_active_book
+from database.db import (
+    ensure_user,
+    create_book_with_plan,
+    get_active_book,
+    get_user_books,
+    get_book_by_id,
+    set_active_book,
+)
 from services.converter import convert_book_to_markdown, count_words
 from services.splitter import estimate_pages, split_text_into_days
 
@@ -21,6 +29,25 @@ class BookUploadStates(StatesGroup):
 def _safe_filename(name: str) -> str:
     cleaned = re.sub(r'[\\/:*?"<>|]+', "_", name).strip()
     return cleaned or "book"
+
+
+def _books_switch_keyboard(books: list[dict], active_book_id: int | None) -> InlineKeyboardMarkup | None:
+    if not books:
+        return None
+    rows: list[list[InlineKeyboardButton]] = []
+    for b in books[:10]:
+        pct = min(100, round(b.get("read_words", 0) / max(1, b.get("total_words", 1)) * 100))
+        prefix = "▶️ " if b["id"] == active_book_id else "📘 "
+        short_title = b["title"][:28] + ("…" if len(b["title"]) > 28 else "")
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{prefix}{short_title} ({pct}%)",
+                    callback_data=f"switch_book:{b['id']}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @router.message(Command("book"))
@@ -39,13 +66,26 @@ async def cmd_book(message: Message, state: FSMContext) -> None:
     )
 
     active_book = await get_active_book(db_path, message.from_user.id)
+    books = await get_user_books(db_path, message.from_user.id)
+    active_id = active_book["id"] if active_book else None
+
     info_lines = []
     if active_book:
-        info_lines.append(
-            f"📘 <b>Қазіргі белсенді кітап:</b> {active_book['title']}\n"
-            f"📄 Шамамен бет саны: <b>~{active_book['total_pages']} бет</b> "
-            f"({active_book['total_words']:,} сөз)\n"
+        read_pages = min(
+            active_book["total_pages"],
+            round(active_book.get("read_words", 0) / max(1, settings.WORDS_PER_PAGE)),
         )
+        pct = min(
+            100,
+            round(active_book.get("read_words", 0) / max(1, active_book.get("total_words", 1)) * 100),
+        )
+        info_lines.append(
+            f"📘 <b>Қазіргі белсенді кітап:</b> {html.escape(active_book['title'])}\n"
+            f"📊 Прогресс: <b>~{read_pages} / ~{active_book['total_pages']} бет ({pct}%)</b>\n"
+        )
+
+    if len(books) > 1:
+        info_lines.append("Төмендегі кітаптардың бірін таңдап, тоқтаған жеріңізден жалғастыра аласыз:\n")
 
     info_lines.append(
         "Жаңа кітап жүктеу үшін <b>PDF</b> немесе <b>EPUB</b> файлын жіберіңіз.\n"
@@ -53,7 +93,41 @@ async def cmd_book(message: Message, state: FSMContext) -> None:
     )
 
     await state.set_state(BookUploadStates.waiting_for_book)
-    await message.answer("\n".join(info_lines))
+    kb = _books_switch_keyboard(books, active_id) if len(books) > 1 else None
+    await message.answer("\n".join(info_lines), reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("switch_book:"))
+async def on_switch_book(callback: CallbackQuery) -> None:
+    try:
+        book_id = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("Қате кітап нөмірі.", show_alert=True)
+        return
+
+    db_path = str(settings.DB_PATH)
+    book = await get_book_by_id(db_path, book_id, callback.from_user.id)
+    if not book:
+        await callback.answer("Кітап табылмады.", show_alert=True)
+        return
+
+    await set_active_book(db_path, callback.from_user.id, book_id)
+
+    read_pages = min(
+        book["total_pages"],
+        round(book.get("read_words", 0) / max(1, settings.WORDS_PER_PAGE)),
+    )
+    pct = min(
+        100,
+        round(book.get("read_words", 0) / max(1, book.get("total_words", 1)) * 100),
+    )
+
+    await callback.message.answer(
+        f"✅ Белсенді кітап ауыстырылды: <b>{html.escape(book['title'])}</b>\n"
+        f"📍 Тоқтаған жеріңіз: <b>~{read_pages} / ~{book['total_pages']} бет ({pct}%)</b>\n\n"
+        "Жалғастыру үшін <b>«📖 Порция ал»</b> батырмасын басыңыз!"
+    )
+    await callback.answer("Кітап ауыстырылды")
 
 
 @router.message(BookUploadStates.waiting_for_book, F.document)
@@ -112,7 +186,7 @@ async def process_book_document(message: Message, state: FSMContext, bot: Bot) -
         )
 
         await status_msg.edit_text(
-            f"✅ <b>«{base_title}»</b> сәтті жүктелді!\n\n"
+            f"✅ <b>«{html.escape(base_title)}»</b> сәтті жүктелді!\n\n"
             f"📊 Жалпы көлемі: <b>~{total_pages} бет</b> ({total_words:,} сөз)\n"
             f"📅 Бөліну мерзімі: <b>{settings.DAYS_PER_BOOK} күн</b> "
             f"(орташа күніне ~{avg_daily_pages} бет)\n\n"
@@ -121,6 +195,6 @@ async def process_book_document(message: Message, state: FSMContext, bot: Bot) -
         )
     except Exception as e:
         await status_msg.edit_text(
-            f"❌ Кітапты өңдеу кезінде қате шықты:\n<code>{e}</code>\n\n"
+            f"❌ Кітапты өңдеу кезінде қате шықты:\n<code>{html.escape(str(e))}</code>\n\n"
             "Басқа PDF/EPUB файл жіберіп көріңіз."
         )
