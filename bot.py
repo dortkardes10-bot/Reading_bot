@@ -51,7 +51,7 @@ async def main() -> None:
         )
         await message.answer(
             f"Сәлем, {message.from_user.first_name}! 👋\n\n"
-            "Мен сенің жеке оқу көмекшісіңмін.\n"
+            "Мен сенің жеке оқу көмекшіңмін.\n"
             "Аптасына бір кітапты аяқтауға көмектесемін.\n\n"
             "Төмендегі батырмаларды пайдаланыңыз:",
             reply_markup=main_menu(),

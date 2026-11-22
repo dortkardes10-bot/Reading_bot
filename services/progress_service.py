@@ -1,6 +1,6 @@
 import html
 import re
-from services.converter import count_words
+from services.converter import count_words, normalize_arabic_text
 
 
 HEADING_LINE_RE = re.compile(
@@ -18,10 +18,11 @@ def make_progress_bar(percent: int, length: int = 8) -> str:
 def format_portion_html(text: str) -> str:
     """
     Markdown порция мәтінін Telegram HTML форматына әдемілеп айналдырады:
+    - Арабша әріптерді қалыпқа келтіреді
     - Тақырыптар мен тарау атауларын қалың (<b>) қылады
     - **қалың** және *курсив* белгілерді өңдейді
-    - Барлық қалған мәтінді HTML тегтерімен қақтығыспайтындай қауіпсіз экранирлейді
     """
+    text = normalize_arabic_text(text)
     lines = text.splitlines()
     formatted_lines: list[str] = []
 
@@ -42,7 +43,6 @@ def format_portion_html(text: str) -> str:
             formatted_lines.append(f"\n<b>📌 {html.escape(title_clean)}</b>")
             continue
 
-        # Қарапайым жолды алдымен HTML-ге қауіпсіз етіп, сосын **bold** пен *italic* өңдеу
         escaped = html.escape(stripped)
         escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
         escaped = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", escaped)
@@ -57,7 +57,7 @@ def split_message_chunks(text: str, max_len: int = 3800) -> list[str]:
     """
     Telegram-ның 4096 таңба шегіне жеткізбей, мәтінді бірнеше хабарламаға бөледі.
     """
-    text = text.strip()
+    text = normalize_arabic_text(text).strip()
     if not text:
         return []
     if len(text) <= max_len:

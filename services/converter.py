@@ -1,5 +1,6 @@
 import os
 import re
+import unicodedata
 from pathlib import Path
 
 from markitdown import MarkItDown
@@ -12,6 +13,49 @@ try:
 except ImportError:
     HAS_OCR_DEPS = False
 
+try:
+    import arabic_reshaper
+    HAS_ARABIC_RESHAPER = True
+except ImportError:
+    HAS_ARABIC_RESHAPER = False
+
+
+ARABIC_CHAR_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
+
+
+def normalize_arabic_text(text: str) -> str:
+    """
+    Араб әріптерінің Unicode пішіндерін қалыпқа келтіреді және мүмкін болса жалғастырады.
+    """
+    if not text:
+        return text
+
+    # Бөлек презентациялық таңбаларды (presentation forms) стандартты араб әріптеріне келтіру
+    normalized = unicodedata.normalize("NFKC", text)
+
+    # Егер мәтінде араб әріптері болса және arabic_reshaper орнатылған болса, әріптерді байланыстыру
+    if ARABIC_CHAR_RE.search(normalized) and HAS_ARABIC_RESHAPER:
+        try:
+            reshaper = arabic_reshaper.ArabicReshaper(
+                configuration={
+                    "delete_harakat": False,
+                    "delete_tatweel": False,
+                    "support_ligatures": True,
+                }
+            )
+            # Әр жолды жеке өңдеу (жол үзілістерін бұзбау үшін)
+            out_lines: list[str] = []
+            for line in normalized.splitlines():
+                if ARABIC_CHAR_RE.search(line):
+                    out_lines.append(reshaper.reshape(line))
+                else:
+                    out_lines.append(line)
+            normalized = "\n".join(out_lines)
+        except Exception:
+            pass
+
+    return normalized
+
 
 def count_words(text: str) -> int:
     words = re.findall(r"\b\w+\b", text, flags=re.UNICODE)
@@ -19,7 +63,8 @@ def count_words(text: str) -> int:
 
 
 def clean_markdown(raw_text: str) -> str:
-    text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+    text = normalize_arabic_text(raw_text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
@@ -32,7 +77,7 @@ def _configure_tesseract() -> None:
         pytesseract.pytesseract.tesseract_cmd = str(default_win_path)
 
 
-def _ocr_pdf_file(pdf_path: str, lang: str = "rus+eng") -> str:
+def _ocr_pdf_file(pdf_path: str, lang: str = "ara+rus+eng") -> str:
     if not HAS_OCR_DEPS:
         raise RuntimeError(
             "OCR кітапханалары орнатылмаған. Терминалда: "
@@ -47,7 +92,6 @@ def _ocr_pdf_file(pdf_path: str, lang: str = "rus+eng") -> str:
         return ""
 
     recognized_pages: list[str] = []
-    # Әр бетті жеке өңдеп, жадты (RAM) үнемдеу
     for page_num in range(1, num_pages + 1):
         images = convert_from_path(
             pdf_path,
@@ -59,8 +103,10 @@ def _ocr_pdf_file(pdf_path: str, lang: str = "rus+eng") -> str:
             try:
                 page_text = pytesseract.image_to_string(img, lang=lang)
             except pytesseract.TesseractError:
-                # Егер rus тіл пакеті жоқ болса, әдепкі тілмен оқу
-                page_text = pytesseract.image_to_string(img)
+                try:
+                    page_text = pytesseract.image_to_string(img, lang="rus+eng")
+                except pytesseract.TesseractError:
+                    page_text = pytesseract.image_to_string(img)
 
             cleaned_page = clean_markdown(page_text)
             if cleaned_page:
@@ -85,7 +131,6 @@ def convert_book_to_markdown(file_path: str, md_output_path: str) -> tuple[str, 
 
     cleaned_text = clean_markdown(raw_markdown)
 
-    # Егер PDF суреттік болса және мәтін аз немесе мүлдем болмаса — OCR қолдану
     if ext == ".pdf" and count_words(cleaned_text) < 30:
         ocr_text = _ocr_pdf_file(file_path)
         if count_words(ocr_text) > count_words(cleaned_text):
