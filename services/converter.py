@@ -13,48 +13,14 @@ try:
 except ImportError:
     HAS_OCR_DEPS = False
 
-try:
-    import arabic_reshaper
-    HAS_ARABIC_RESHAPER = True
-except ImportError:
-    HAS_ARABIC_RESHAPER = False
-
-
-ARABIC_CHAR_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
-
 
 def normalize_arabic_text(text: str) -> str:
     """
-    Араб әріптерінің Unicode пішіндерін қалыпқа келтіреді және мүмкін болса жалғастырады.
+    Араб әріптерінің Unicode пішіндерін қалыпты таза күйге келтіреді.
     """
     if not text:
-        return text
-
-    # Бөлек презентациялық таңбаларды (presentation forms) стандартты араб әріптеріне келтіру
-    normalized = unicodedata.normalize("NFKC", text)
-
-    # Егер мәтінде араб әріптері болса және arabic_reshaper орнатылған болса, әріптерді байланыстыру
-    if ARABIC_CHAR_RE.search(normalized) and HAS_ARABIC_RESHAPER:
-        try:
-            reshaper = arabic_reshaper.ArabicReshaper(
-                configuration={
-                    "delete_harakat": False,
-                    "delete_tatweel": False,
-                    "support_ligatures": True,
-                }
-            )
-            # Әр жолды жеке өңдеу (жол үзілістерін бұзбау үшін)
-            out_lines: list[str] = []
-            for line in normalized.splitlines():
-                if ARABIC_CHAR_RE.search(line):
-                    out_lines.append(reshaper.reshape(line))
-                else:
-                    out_lines.append(line)
-            normalized = "\n".join(out_lines)
-        except Exception:
-            pass
-
-    return normalized
+        return ""
+    return unicodedata.normalize("NFKC", text)
 
 
 def count_words(text: str) -> int:

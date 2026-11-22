@@ -1,10 +1,12 @@
 import html
 import re
-from services.converter import count_words, normalize_arabic_text
+import unicodedata
+from services.converter import count_words
 
 
-HEADING_LINE_RE = re.compile(
-    r"^(?:#{1,6}\s+(.+)|(?:тарау|бөлім|кіріспе|қорытынды|глава|часть|chapter|part)\b.+)$",
+ARABIC_CHAR_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
+HEADING_KEYWORD_RE = re.compile(
+    r"^(?:#{1,6}\s*|тарау|бөлім|кіріспе|қорытынды|алғы сөз|глава|часть|введение|заключение|chapter|part|introduction|conclusion)\b",
     flags=re.IGNORECASE,
 )
 
@@ -15,56 +17,127 @@ def make_progress_bar(percent: int, length: int = 8) -> str:
     return "🟩" * filled + "⬜" * (length - filled)
 
 
+def prepare_readable_text(text: str) -> str:
+    """
+    PDF/MD мәтінін қалыпқа келтіреді:
+    - Арабша таңбаларды таза Unicode күйіне келтіреді
+    - Сөйлем ортасынан үзілген қысқа жолдарды біріктіріп, таза абзацтар түзеді
+    """
+    if not text:
+        return ""
+
+    cleaned = unicodedata.normalize("NFKC", text)
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    # Жол соңындағы тасымал сызықшаларын (мысалы: сөз-\nдің -> сөздің) біріктіру
+    cleaned = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", cleaned)
+
+    raw_lines = [line.strip() for line in cleaned.split("\n")]
+    paragraphs: list[str] = []
+    current_para: list[str] = []
+
+    def _flush_para() -> None:
+        if current_para:
+            joined = re.sub(r"\s+", " ", " ".join(current_para)).strip()
+            if joined:
+                paragraphs.append(joined)
+            current_para.clear()
+
+    for line in raw_lines:
+        if not line:
+            _flush_para()
+            continue
+
+        # Тақырып сияқты көрінетін жолды бөлек абзац ретінде шығару
+        is_md_heading = bool(re.match(r"^#{1,6}\s+.+$", line))
+        is_keyword_heading = bool(HEADING_KEYWORD_RE.match(line)) and len(line) <= 110
+        is_short_title = (
+            len(line) <= 65
+            and not re.search(r"[.!?:;…]$", line)
+            and len(line.split()) <= 8
+            and not current_para
+        )
+
+        if is_md_heading or is_keyword_heading or is_short_title:
+            _flush_para()
+            paragraphs.append(line)
+            continue
+
+        current_para.append(line)
+
+        # Егер жол соңында нүкте/сұрақ/леп белгісі болса және келесі жол үлкен әріппен басталса,
+        # абзацты аяқтауға мүмкіндік береміз, бірақ сөйлем үзілмесе жалғай береміз
+        if len(line) > 95 and re.search(r"[.!?…]$", line):
+            _flush_para()
+
+    _flush_para()
+    return "\n\n".join(paragraphs).strip()
+
+
+def _is_heading_paragraph(para: str) -> bool:
+    s = para.strip()
+    if not s:
+        return False
+    if re.match(r"^#{1,6}\s+.+$", s):
+        return True
+    if HEADING_KEYWORD_RE.match(s) and len(s) <= 110:
+        return True
+    # Қысқа, соңында нүктесі жоқ жолдар (мысалы, кітаптағы бөлім/тақырып атауы)
+    words = s.split()
+    if len(s) <= 60 and 1 <= len(words) <= 7 and not re.search(r"[.!?…,:;]$", s):
+        return True
+    return False
+
+
 def format_portion_html(text: str) -> str:
     """
-    Markdown порция мәтінін Telegram HTML форматына әдемілеп айналдырады:
-    - Арабша әріптерді қалыпқа келтіреді
-    - Тақырыптар мен тарау атауларын қалың (<b>) қылады
-    - **қалың** және *курсив* белгілерді өңдейді
+    Мәтінді реттеп, тақырыптарды қалың (<b>...</b>) етіп Telegram HTML форматына келтіреді.
     """
-    text = normalize_arabic_text(text)
-    lines = text.splitlines()
-    formatted_lines: list[str] = []
+    readable = prepare_readable_text(text)
+    if not readable:
+        return ""
 
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            formatted_lines.append("")
+    blocks = readable.split("\n\n")
+    out_blocks: list[str] = []
+
+    for block in blocks:
+        b = block.strip()
+        if not b:
             continue
 
-        md_heading = re.match(r"^#{1,6}\s+(.+)$", stripped)
-        if md_heading:
-            title_clean = md_heading.group(1).strip().strip("*").strip()
-            formatted_lines.append(f"\n<b>📌 {html.escape(title_clean)}</b>")
+        if _is_heading_paragraph(b):
+            heading_clean = re.sub(r"^#{1,6}\s*", "", b).strip().strip("*").strip()
+            heading_html = f"<b>📌 {html.escape(heading_clean)}</b>"
+            if ARABIC_CHAR_RE.search(heading_clean):
+                heading_html = "\u200f" + heading_html
+            out_blocks.append(heading_html)
             continue
 
-        if HEADING_LINE_RE.match(stripped) and len(stripped) <= 120:
-            title_clean = stripped.strip("*").strip()
-            formatted_lines.append(f"\n<b>📌 {html.escape(title_clean)}</b>")
-            continue
-
-        escaped = html.escape(stripped)
+        escaped = html.escape(b)
         escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
         escaped = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", escaped)
-        formatted_lines.append(escaped)
 
-    result = "\n".join(formatted_lines)
-    result = re.sub(r"\n{3,}", "\n\n", result)
-    return result.strip()
+        # Егер абзацта араб әріптері басым болса, оңнан-солға бағыт белгісін қосу
+        arabic_count = len(ARABIC_CHAR_RE.findall(b))
+        if arabic_count >= 5:
+            escaped = "\u200f" + escaped
+
+        out_blocks.append(escaped)
+
+    return "\n\n".join(out_blocks).strip()
 
 
-def split_message_chunks(text: str, max_len: int = 3800) -> list[str]:
+def split_message_chunks(text: str, max_len: int = 3500) -> list[str]:
     """
-    Telegram-ның 4096 таңба шегіне жеткізбей, мәтінді бірнеше хабарламаға бөледі.
+    Telegram-ның 4096 таңба шегіне жеткізбей, реттелген мәтінді абзац бойынша бөледі.
     """
-    text = normalize_arabic_text(text).strip()
-    if not text:
+    readable = prepare_readable_text(text)
+    if not readable:
         return []
-    if len(text) <= max_len:
-        return [text]
+    if len(readable) <= max_len:
+        return [readable]
 
     chunks: list[str] = []
-    remaining = text
+    remaining = readable
 
     while len(remaining) > max_len:
         window = remaining[:max_len]
