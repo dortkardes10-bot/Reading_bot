@@ -1,5 +1,56 @@
+import html
 import re
 from services.converter import count_words
+
+
+HEADING_LINE_RE = re.compile(
+    r"^(?:#{1,6}\s+(.+)|(?:тарау|бөлім|кіріспе|қорытынды|глава|часть|chapter|part)\b.+)$",
+    flags=re.IGNORECASE,
+)
+
+
+def make_progress_bar(percent: int, length: int = 8) -> str:
+    clamped = max(0, min(100, percent))
+    filled = round((clamped / 100) * length)
+    return "🟩" * filled + "⬜" * (length - filled)
+
+
+def format_portion_html(text: str) -> str:
+    """
+    Markdown порция мәтінін Telegram HTML форматына әдемілеп айналдырады:
+    - Тақырыптар мен тарау атауларын қалың (<b>) қылады
+    - **қалың** және *курсив* белгілерді өңдейді
+    - Барлық қалған мәтінді HTML тегтерімен қақтығыспайтындай қауіпсіз экранирлейді
+    """
+    lines = text.splitlines()
+    formatted_lines: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            formatted_lines.append("")
+            continue
+
+        md_heading = re.match(r"^#{1,6}\s+(.+)$", stripped)
+        if md_heading:
+            title_clean = md_heading.group(1).strip().strip("*").strip()
+            formatted_lines.append(f"\n<b>📌 {html.escape(title_clean)}</b>")
+            continue
+
+        if HEADING_LINE_RE.match(stripped) and len(stripped) <= 120:
+            title_clean = stripped.strip("*").strip()
+            formatted_lines.append(f"\n<b>📌 {html.escape(title_clean)}</b>")
+            continue
+
+        # Қарапайым жолды алдымен HTML-ге қауіпсіз етіп, сосын **bold** пен *italic* өңдеу
+        escaped = html.escape(stripped)
+        escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
+        escaped = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", escaped)
+        formatted_lines.append(escaped)
+
+    result = "\n".join(formatted_lines)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
 
 
 def split_message_chunks(text: str, max_len: int = 3800) -> list[str]:
@@ -17,10 +68,8 @@ def split_message_chunks(text: str, max_len: int = 3800) -> list[str]:
 
     while len(remaining) > max_len:
         window = remaining[:max_len]
-        # Алдымен абзац соңын іздеу
         cut_pos = window.rfind("\n\n")
         if cut_pos < int(max_len * 0.5):
-            # Болмаса сөйлем соңын (. ! ? …) іздеу
             match = None
             for m in re.finditer(r"[.!?…]+(?:\s+|\n|$)", window):
                 if m.end() >= int(max_len * 0.5):
@@ -57,14 +106,12 @@ def extract_next_portion(
         return "", 0, start_char, start_char, True
 
     actual_start = start_char
-    # Бастапқы бос орындарды өткізу
     while actual_start < total_len and full_text[actual_start].isspace():
         actual_start += 1
 
     if actual_start >= total_len:
         return "", 0, total_len, total_len, True
 
-    # Сөз санап отырып шамамен target_words-ке жету
     word_pattern = re.compile(r"\b\w+\b", flags=re.UNICODE)
     words_seen = 0
     cut_index = total_len
@@ -75,11 +122,9 @@ def extract_next_portion(
             cut_index = match.end()
             break
 
-    # Егер кітаптың соңына жақын қалса, соңына дейін қоса салу
     if total_len - cut_index < 250:
         cut_index = total_len
     elif cut_index < total_len:
-        # Сөйлемнің ортасынан үзбеу үшін келесі тыныс белгісіне дейін созу (макс +220 таңба)
         tail = full_text[cut_index : min(total_len, cut_index + 220)]
         sent_match = re.search(r"[.!?…]+(?:\s+|\n|$)", tail)
         if sent_match:

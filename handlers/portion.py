@@ -17,7 +17,12 @@ from database.db import (
     update_user_portion_pages,
 )
 from keyboards.inline import portion_keyboard
-from services.progress_service import extract_next_portion, split_message_chunks
+from services.progress_service import (
+    extract_next_portion,
+    split_message_chunks,
+    format_portion_html,
+    make_progress_bar,
+)
 
 router = Router()
 
@@ -52,7 +57,6 @@ async def _send_portion_to_user(
     pages_to_read = portion_pages or (user["portion_pages"] if user else settings.DEFAULT_PORTION_PAGES)
     target_words = max(150, pages_to_read * settings.WORDS_PER_PAGE)
 
-    # Егер бұрын «Кейінірек» деп қалдырылған порция болса, соны қайта ұсыну
     pending = await get_pending_portion(db_path, user_id, book["id"])
     if pending and portion_pages is None:
         portion_id = pending["id"]
@@ -68,7 +72,7 @@ async def _send_portion_to_user(
             target_words=target_words,
         )
 
-        if not portion_text or is_finished and actual_words == 0:
+        if not portion_text or (is_finished and actual_words == 0):
             await message.answer(
                 f"🎉 Құттықтаймын! <b>«{html.escape(book['title'])}»</b> кітабын толық аяқтадыңыз!\n"
                 "Жаңа кітап жүктеу үшін <b>«📚 Кітап»</b> батырмасын басыңыз."
@@ -89,22 +93,31 @@ async def _send_portion_to_user(
             content_text=portion_text,
         )
 
+    summary = await get_book_progress_summary(db_path, book["id"])
+    cur_day = summary.get("current_day")
+    day_pct_text = ""
+    if cur_day and cur_day.get("target_words", 0) > 0:
+        d_pct = min(100, round(cur_day["read_words"] / cur_day["target_words"] * 100))
+        day_pct_text = f"\n{make_progress_bar(d_pct)} <b>{d_pct}%</b> (күндік меже)"
+
     approx_pages = max(1, round(actual_words / max(1, settings.WORDS_PER_PAGE)))
-    chunks = split_message_chunks(portion_text, max_len=3800)
+    chunks = split_message_chunks(portion_text, max_len=3500)
 
     header = (
-        f"📖 <b>{html.escape(book['title'])}</b> — {day_num}-күн\n"
-        f"Көлемі: <b>~{approx_pages} бет</b> ({actual_words} сөз) | Бөлік саны: {len(chunks)}"
+        f"📖 <b>{html.escape(book['title'])}</b> — <b>{day_num}-күн</b>\n"
+        f"Көлемі: <b>~{approx_pages} бет</b> ({actual_words} сөз) • Бөлік: {len(chunks)}"
+        f"{day_pct_text}"
     )
     await message.answer(header)
 
     for idx, chunk in enumerate(chunks, start=1):
-        safe_chunk = html.escape(chunk)
+        styled_chunk = format_portion_html(chunk)
+        footer = f"\n\n<i>({idx}/{len(chunks)})</i>"
         if idx < len(chunks):
-            await message.answer(f"{safe_chunk}\n\n<i>({idx}/{len(chunks)})</i>")
+            await message.answer(f"{styled_chunk}{footer}")
         else:
             await message.answer(
-                f"{safe_chunk}\n\n<i>({idx}/{len(chunks)})</i>",
+                f"{styled_chunk}{footer}",
                 reply_markup=portion_keyboard(portion_id),
             )
 
@@ -117,7 +130,8 @@ async def on_get_portion(message: Message) -> None:
 @router.callback_query(F.data.startswith("portion_read:"))
 async def on_portion_read(callback: CallbackQuery) -> None:
     portion_id = int(callback.data.split(":", 1)[1])
-    portion = await get_portion_by_id(str(settings.DB_PATH), portion_id)
+    db_path = str(settings.DB_PATH)
+    portion = await get_portion_by_id(db_path, portion_id)
 
     if not portion:
         await callback.answer("Порция табылмады.", show_alert=True)
@@ -128,18 +142,58 @@ async def on_portion_read(callback: CallbackQuery) -> None:
         return
 
     await mark_portion_read_and_update_progress(
-        db_path=str(settings.DB_PATH),
+        db_path=db_path,
         user_id=portion["user_id"],
         book_id=portion["book_id"],
         portion_id=portion_id,
         words_count=portion["words_count"],
     )
 
+    book = await get_active_book(db_path, portion["user_id"])
+    user = await get_user(db_path, portion["user_id"])
+    summary = await get_book_progress_summary(db_path, portion["book_id"])
+    cur_day = summary.get("current_day")
+
     approx_pages = max(1, round(portion["words_count"] / max(1, settings.WORDS_PER_PAGE)))
+    streak = user["streak_days"] if user else 1
+
+    motivation_line = "🔥 Керемет қарқын! Келесі порцияны алып, бүгінгі межені жауып тастаңыз."
+    day_info_line = ""
+
+    if cur_day and cur_day.get("target_words", 0) > 0:
+        d_target = cur_day["target_words"]
+        d_read = cur_day["read_words"]
+        d_pct = min(100, round(d_read / d_target * 100))
+        rem_pages = max(0, round((d_target - d_read) / max(1, settings.WORDS_PER_PAGE)))
+        day_info_line = f"\n{make_progress_bar(d_pct)} <b>{d_pct}%</b> ({cur_day['day_number']}-күн)"
+
+        if cur_day.get("is_completed") or d_pct >= 100:
+            motivation_line = (
+                f"🏆 <b>{cur_day['day_number']}-күннің нормасы толық орындалды!</b> "
+                f"Қатарынан <b>{streak} күн</b> оқып келесіз — ертеңге де осы қарқынмен!"
+            )
+        elif rem_pages <= 5:
+            motivation_line = (
+                f"⚡ Бүгінгі межеге бар болғаны <b>~{rem_pages} бет</b> қалды! "
+                "Дәл қазір бір порциямен аяқтап тастасаңыз, күн толық жабылады!"
+            )
+        else:
+            motivation_line = (
+                f"💪 Бүгінгі нормадан әлі <b>~{rem_pages} бет</b> қалды. "
+                "Келесі порцияны алып, біртіндеп алға жылжиық!"
+            )
+
+    book_pct_line = ""
+    if book and book.get("total_words", 0) > 0:
+        b_pct = min(100, round(book.get("read_words", 0) / book["total_words"] * 100))
+        book_pct_line = f"\n📚 Кітап бойынша: <b>{b_pct}%</b>"
+
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(
-        f"✅ Тамаша! <b>~{approx_pages} бет</b> ({portion['words_count']} сөз) оқылды деп белгіленді.\n"
-        "Келесі бөлік үшін <b>«📖 Порция ал»</b> батырмасын басыңыз."
+        f"✅ <b>~{approx_pages} бет</b> ({portion['words_count']} сөз) оқылды деп белгіленді!"
+        f"{day_info_line}"
+        f"{book_pct_line}\n\n"
+        f"{motivation_line}"
     )
     await callback.answer("Оқылды деп сақталды!")
 
@@ -157,7 +211,7 @@ async def on_portion_later(callback: CallbackQuery) -> None:
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(
         "⏳ Жарайды, порция кейінге қалдырылды.\n"
-        "Қайта оқуға дайын болғанда <b>«📖 Порция ал»</b> батырмасын басыңыз — сол жерден жалғастырамыз."
+        "Қайта оқуға дайын болғанда <b>«📖 Порция ал»</b> батырмасын басыңыз — тоқтаған жерден жалғастырамыз."
     )
     await callback.answer("Кейінге қалдырылды")
 
